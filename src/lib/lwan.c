@@ -280,7 +280,7 @@ void lwan_set_url_map(struct lwan *l, const struct lwan_url_map *map)
             copy->data = copy->module->create (map->prefix, copy->args);
             copy->flags = copy->module->flags;
             copy->handler = copy->module->handle_request;
-        } else {
+        } else if (!copy->flags) {
             copy->flags = HANDLER_PARSE_MASK;
         }
     }

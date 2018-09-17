@@ -37,9 +37,12 @@
 
 #include "lwan-private.h"
 
+#include "base64.h"
+#include "list.h"
 #include "lwan-config.h"
 #include "lwan-http-authorize.h"
-#include "list.h"
+#include "lwan-io-wrappers.h"
+#include "sha1.h"
 
 enum lwan_read_finalizer {
     FINALIZER_DONE,
@@ -74,13 +77,14 @@ struct lwan_request_parser_helper {
     struct lwan_value content_type;	/* Content-Type: for POST */
     struct lwan_value content_length;	/* Content-Length: */
 
+    struct lwan_value connection;	/* Connection: */
+
     char *header_start[64];		/* Headers: n: start, n+1: end */
     size_t n_header_start;		/* len(header_start) */
 
     time_t error_when_time;		/* Time to abort request read */
     int error_when_n_packets;		/* Max. number of packets */
     int urls_rewritten;			/* Times URLs have been rewritten */
-    char connection;			/* k=keep-alive, c=close, u=upgrade */
 };
 
 struct proxy_header_v2 {
@@ -499,19 +503,14 @@ identify_http_path(struct lwan_request *request, char *buffer)
     return end_of_line + 1;
 }
 
-#define HEADER_RAW(hdr)                                                        \
+#define HEADER(hdr)                                                            \
     ({                                                                         \
         p += sizeof(hdr) - 1;                                                  \
         if (UNLIKELY(string_as_int16(p) !=                                     \
                      MULTICHAR_CONSTANT_SMALL(':', ' ')))                      \
             continue;                                                          \
         *end = '\0';                                                           \
-        p + sizeof(": ") - 1;                                                  \
-    })
-
-#define HEADER(hdr)                                                            \
-    ({                                                                         \
-        char *value = HEADER_RAW(hdr);                                         \
+        char *value = p + sizeof(": ") - 1;                                    \
         (struct lwan_value){.value = value, .len = (size_t)(end - value)};     \
     })
 
@@ -562,7 +561,7 @@ process:
             helper->authorization = HEADER("Authorization");
             break;
         case MULTICHAR_CONSTANT_L('C','o','n','n'):
-            helper->connection = *HEADER_RAW("Connection") | 0x20;
+            helper->connection = HEADER("Connection");
             break;
         case MULTICHAR_CONSTANT_L('C','o','n','t'):
             p += sizeof("Content") - 1;
@@ -688,15 +687,34 @@ ignore_leading_whitespace(char *buffer)
     return buffer;
 }
 
-static ALWAYS_INLINE void compute_keep_alive_flag(struct lwan_request *request)
+static ALWAYS_INLINE void parse_connection_header(struct lwan_request *request)
 {
     struct lwan_request_parser_helper *helper = request->helper;
-    bool is_keep_alive;
+    bool is_keep_alive = false;
+    bool is_close = false;
 
-    if (request->flags & REQUEST_IS_HTTP_1_0)
-        is_keep_alive = (helper->connection == 'k');
-    else
-        is_keep_alive = (helper->connection != 'c');
+    for (const char *p = helper->connection.value; *p; p++) {
+        STRING_SWITCH_L(p) {
+        case MULTICHAR_CONSTANT_L('k','e','e','p'):
+        case MULTICHAR_CONSTANT_L(' ', 'k','e','e'):
+            is_keep_alive = true;
+            break;
+        case MULTICHAR_CONSTANT_L('c','l','o','s'):
+        case MULTICHAR_CONSTANT_L(' ', 'c','l','o'):
+            is_close = true;
+            break;
+        case MULTICHAR_CONSTANT_L('u','p','g','r'):
+        case MULTICHAR_CONSTANT_L(' ', 'u','p','g'):
+            request->conn->flags |= CONN_IS_UPGRADE;
+            break;
+        }
+
+        if (!(p = strchr(p, ',')))
+            break;
+    }
+
+    if (LIKELY(!(request->flags & REQUEST_IS_HTTP_1_0)))
+        is_keep_alive = !is_close;
 
     if (is_keep_alive)
         request->conn->flags |= CONN_KEEP_ALIVE;
@@ -1087,15 +1105,78 @@ parse_http_request(struct lwan_request *request)
         return HTTP_BAD_REQUEST;
     request->original_url.len = request->url.len = (size_t)decoded_len;
 
-    compute_keep_alive_flag(request);
+    parse_connection_header(request);
 
     return HTTP_OK;
+}
+
+enum lwan_http_status
+lwan_request_websocket_upgrade(struct lwan_request *request)
+{
+    static const unsigned char websocket_uuid[] =
+        "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+    char header_buf[DEFAULT_HEADERS_SIZE];
+    size_t header_buf_len;
+    unsigned char digest[20];
+    sha1_context ctx;
+    char *encoded;
+
+    if (UNLIKELY(request->flags & RESPONSE_SENT_HEADERS))
+        return HTTP_INTERNAL_ERROR;
+
+    if (UNLIKELY(!(request->conn->flags & CONN_IS_UPGRADE)))
+        return HTTP_BAD_REQUEST;
+
+    const char *upgrade = lwan_request_get_header(request, "Upgrade");
+    if (UNLIKELY(!upgrade || !streq(upgrade, "websocket")))
+        return HTTP_BAD_REQUEST;
+
+    const char *sec_websocket_key =
+        lwan_request_get_header(request, "Sec-WebSocket-Key");
+    if (UNLIKELY(!sec_websocket_key))
+        return HTTP_BAD_REQUEST;
+    const size_t sec_websocket_key_len = strlen(sec_websocket_key);
+    if (UNLIKELY(!base64_validate((void *)sec_websocket_key, sec_websocket_key_len)))
+        return HTTP_BAD_REQUEST;
+
+    sha1_init(&ctx);
+    sha1_update(&ctx, (void *)sec_websocket_key, sec_websocket_key_len);
+    sha1_update(&ctx, websocket_uuid, sizeof(websocket_uuid) - 1);
+    sha1_finalize(&ctx, digest);
+
+    encoded = (char *)base64_encode(digest, sizeof(digest), NULL);
+    if (UNLIKELY(!encoded))
+        return HTTP_INTERNAL_ERROR;
+    coro_defer(request->conn->coro, CORO_DEFER(free), encoded);
+
+    request->flags |= RESPONSE_NO_CONTENT_LENGTH;
+    header_buf_len = lwan_prepare_response_header_full(
+        request, HTTP_SWITCHING_PROTOCOLS, header_buf, sizeof(header_buf),
+        (struct lwan_key_value[]){
+            {.key = "Sec-WebSocket-Accept", .value = encoded},
+            {.key = "Upgrade", .value = "websocket"},
+            {.key = "Connection", .value = "Upgrade"},
+            {},
+        });
+    if (LIKELY(header_buf_len)) {
+        request->conn->flags |= CONN_FLIP_FLAGS;
+        request->flags |= REQUEST_IS_WEBSOCKET;
+
+        lwan_send(request, header_buf, header_buf_len, 0);
+
+        coro_yield(request->conn->coro, CONN_CORO_MAY_RESUME);
+
+        return HTTP_SWITCHING_PROTOCOLS;
+    }
+
+    return HTTP_INTERNAL_ERROR;
 }
 
 static enum lwan_http_status prepare_for_response(struct lwan_url_map *url_map,
                                                   struct lwan_request *request)
 {
     struct lwan_request_parser_helper *helper = request->helper;
+    enum lwan_http_status status;
 
     request->url.value += url_map->prefix_len;
     request->url.len -= url_map->prefix_len;
@@ -1118,8 +1199,6 @@ static enum lwan_http_status prepare_for_response(struct lwan_url_map *url_map,
         parse_accept_encoding(request);
 
     if (lwan_request_get_method(request) == REQUEST_METHOD_POST) {
-        enum lwan_http_status status;
-
         if (!(url_map->flags & HANDLER_HAS_POST_DATA)) {
             /* FIXME: Discard POST data here? If a POST request is sent
              * to a handler that is not supposed to handle a POST request,
