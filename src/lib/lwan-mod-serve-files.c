@@ -902,18 +902,31 @@ compute_range(struct lwan_request *request, off_t *from, off_t *to, off_t size)
         return HTTP_RANGE_UNSATISFIABLE;
 
     /* Range goes beyond the size of the file */
-    if (UNLIKELY(f >= size || t >= size))
-        return HTTP_RANGE_UNSATISFIABLE;
+    if (UNLIKELY(f >= size || t >= size)) {
+        *from = f;
+        *to = size;
+        return HTTP_PARTIAL_CONTENT;
+    }
 
     /* t < 0: ranges from f to the file size */
     if (t < 0) {
-        *to = size;
+        if (f < 0) {
+            // bytes = -x : 
+            f = size + t; // t is negative, calculate the start offset from the end of the file
+            if (f < 0) {
+               return HTTP_RANGE_UNSATISFIABLE;
+            }
+            *from = f;
+            *to = size;
+        } else {
+            // bytes = x- : serve until the end of file
+            *from = f;
+            *to = size;
+        }
     } else {
         if (UNLIKELY(__builtin_sub_overflow(t, f, to)))
             return HTTP_RANGE_UNSATISFIABLE;
     }
-
-    *from = f;
 
     return HTTP_PARTIAL_CONTENT;
 }

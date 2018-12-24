@@ -640,7 +640,7 @@ parse_range(struct lwan_request_parser_helper *helper)
         if (UNLIKELY(to > OFF_MAX))
             goto invalid_range;
 
-        helper->range.from = 0;
+        helper->range.from = -1;
         helper->range.to = (off_t)to;
     } else if (sscanf(range, "%"SCNu64"-", &from) == 1) {
         if (UNLIKELY(from > OFF_MAX))
