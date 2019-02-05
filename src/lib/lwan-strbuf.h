@@ -43,7 +43,8 @@ void lwan_strbuf_reset(struct lwan_strbuf *s);
 
 bool lwan_strbuf_append_char(struct lwan_strbuf *s, const char c);
 bool lwan_strbuf_append_str(struct lwan_strbuf *s1, const char *s2, size_t sz);
-bool lwan_strbuf_append_printf(struct lwan_strbuf *s, const char *fmt, ...);
+bool lwan_strbuf_append_printf(struct lwan_strbuf *s, const char *fmt, ...)
+    __attribute__((format(printf, 2, 3)));
 
 bool lwan_strbuf_set_static(struct lwan_strbuf *s1, const char *s2, size_t sz);
 bool lwan_strbuf_set(struct lwan_strbuf *s1, const char *s2, size_t sz);
@@ -51,6 +52,7 @@ bool lwan_strbuf_printf(struct lwan_strbuf *s1, const char *fmt, ...)
     __attribute__((format(printf, 2, 3)));
 
 bool lwan_strbuf_grow_to(struct lwan_strbuf *s, size_t new_size);
+bool lwan_strbuf_grow_by(struct lwan_strbuf *s, size_t offset);
 
 #define lwan_strbuf_get_length(s) (((struct lwan_strbuf *)(s))->used)
 #define lwan_strbuf_get_buffer(s) (((struct lwan_strbuf *)(s))->value.buffer)

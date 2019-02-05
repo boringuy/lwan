@@ -37,9 +37,14 @@
 
 #include "lwan-private.h"
 
+#include "base64.h"
+#include "list.h"
 #include "lwan-config.h"
 #include "lwan-http-authorize.h"
-#include "list.h"
+#include "lwan-io-wrappers.h"
+#include "sha1.h"
+
+#define N_HEADER_START 64
 
 enum lwan_read_finalizer {
     FINALIZER_DONE,
@@ -74,13 +79,14 @@ struct lwan_request_parser_helper {
     struct lwan_value content_type;	/* Content-Type: for POST */
     struct lwan_value content_length;	/* Content-Length: */
 
-    char *header_start[64];		/* Headers: n: start, n+1: end */
+    struct lwan_value connection;	/* Connection: */
+
+    char **header_start;		/* Headers: n: start, n+1: end */
     size_t n_header_start;		/* len(header_start) */
 
     time_t error_when_time;		/* Time to abort request read */
     int error_when_n_packets;		/* Max. number of packets */
     int urls_rewritten;			/* Times URLs have been rewritten */
-    char connection;			/* k=keep-alive, c=close, u=upgrade */
 };
 
 struct proxy_header_v2 {
@@ -465,12 +471,16 @@ identify_http_path(struct lwan_request *request, char *buffer)
     struct lwan_request_parser_helper *helper = request->helper;
     static const size_t minimal_request_line_len = sizeof("/ HTTP/1.0") - 1;
     char *space, *end_of_line;
+    ptrdiff_t end_len;
 
     if (UNLIKELY(*buffer != '/'))
         return NULL;
 
-    end_of_line = memchr(buffer, '\r',
-        (helper->buffer->len - (size_t)(buffer - helper->buffer->value)));
+    end_len = buffer - helper->buffer->value;
+    if (UNLIKELY((size_t)end_len >= helper->buffer->len))
+        return NULL;
+
+    end_of_line = memchr(buffer, '\r', helper->buffer->len - (size_t)end_len);
     if (UNLIKELY(!end_of_line))
         return NULL;
     if (UNLIKELY((size_t)(end_of_line - buffer) < minimal_request_line_len))
@@ -499,19 +509,14 @@ identify_http_path(struct lwan_request *request, char *buffer)
     return end_of_line + 1;
 }
 
-#define HEADER_RAW(hdr)                                                        \
+#define HEADER(hdr)                                                            \
     ({                                                                         \
         p += sizeof(hdr) - 1;                                                  \
         if (UNLIKELY(string_as_int16(p) !=                                     \
                      MULTICHAR_CONSTANT_SMALL(':', ' ')))                      \
             continue;                                                          \
         *end = '\0';                                                           \
-        p + sizeof(": ") - 1;                                                  \
-    })
-
-#define HEADER(hdr)                                                            \
-    ({                                                                         \
-        char *value = HEADER_RAW(hdr);                                         \
+        char *value = p + sizeof(": ") - 1;                                    \
         (struct lwan_value){.value = value, .len = (size_t)(end - value)};     \
     })
 
@@ -523,7 +528,7 @@ static bool parse_headers(struct lwan_request_parser_helper *helper,
     size_t n_headers = 0;
     bool ret = false;
 
-    for (char *p = buffer + 1; n_headers < N_ELEMENTS(helper->header_start);) {
+    for (char *p = buffer + 1; n_headers < N_HEADER_START && buffer_end > p;) {
         char *next_chr = p;
         char *next_hdr = memchr(next_chr, '\r', (size_t)(buffer_end - p));
 
@@ -562,7 +567,7 @@ process:
             helper->authorization = HEADER("Authorization");
             break;
         case MULTICHAR_CONSTANT_L('C','o','n','n'):
-            helper->connection = *HEADER_RAW("Connection") | 0x20;
+            helper->connection = HEADER("Connection");
             break;
         case MULTICHAR_CONSTANT_L('C','o','n','t'):
             p += sizeof("Content") - 1;
@@ -683,22 +688,45 @@ parse_accept_encoding(struct lwan_request *request)
 static ALWAYS_INLINE char *
 ignore_leading_whitespace(char *buffer)
 {
-    while (*buffer && lwan_char_isspace(*buffer))
+    while (lwan_char_isspace(*buffer))
         buffer++;
     return buffer;
 }
 
-static ALWAYS_INLINE void compute_keep_alive_flag(struct lwan_request *request)
+static ALWAYS_INLINE void parse_connection_header(struct lwan_request *request)
 {
     struct lwan_request_parser_helper *helper = request->helper;
-    bool is_keep_alive;
+    bool has_keep_alive = false;
+    bool has_close = false;
 
-    if (request->flags & REQUEST_IS_HTTP_1_0)
-        is_keep_alive = (helper->connection == 'k');
-    else
-        is_keep_alive = (helper->connection != 'c');
+    if (!helper->connection.len)
+        goto out;
 
-    if (is_keep_alive)
+    for (const char *p = helper->connection.value; *p; p++) {
+        STRING_SWITCH_L(p) {
+        case MULTICHAR_CONSTANT_L('k','e','e','p'):
+        case MULTICHAR_CONSTANT_L(' ', 'k','e','e'):
+            has_keep_alive = true;
+            break;
+        case MULTICHAR_CONSTANT_L('c','l','o','s'):
+        case MULTICHAR_CONSTANT_L(' ', 'c','l','o'):
+            has_close = true;
+            break;
+        case MULTICHAR_CONSTANT_L('u','p','g','r'):
+        case MULTICHAR_CONSTANT_L(' ', 'u','p','g'):
+            request->conn->flags |= CONN_IS_UPGRADE;
+            break;
+        }
+
+        if (!(p = strchr(p, ',')))
+            break;
+    }
+
+out:
+    if (LIKELY(!(request->flags & REQUEST_IS_HTTP_1_0)))
+        has_keep_alive = !has_close;
+
+    if (has_keep_alive)
         request->conn->flags |= CONN_KEEP_ALIVE;
     else
         request->conn->flags &= ~CONN_KEEP_ALIVE;
@@ -1087,9 +1115,70 @@ parse_http_request(struct lwan_request *request)
         return HTTP_BAD_REQUEST;
     request->original_url.len = request->url.len = (size_t)decoded_len;
 
-    compute_keep_alive_flag(request);
+    parse_connection_header(request);
 
     return HTTP_OK;
+}
+
+enum lwan_http_status
+lwan_request_websocket_upgrade(struct lwan_request *request)
+{
+    static const unsigned char websocket_uuid[] =
+        "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+    char header_buf[DEFAULT_HEADERS_SIZE];
+    size_t header_buf_len;
+    unsigned char digest[20];
+    sha1_context ctx;
+    char *encoded;
+
+    if (UNLIKELY(request->flags & RESPONSE_SENT_HEADERS))
+        return HTTP_INTERNAL_ERROR;
+
+    if (UNLIKELY(!(request->conn->flags & CONN_IS_UPGRADE)))
+        return HTTP_BAD_REQUEST;
+
+    const char *upgrade = lwan_request_get_header(request, "Upgrade");
+    if (UNLIKELY(!upgrade || !streq(upgrade, "websocket")))
+        return HTTP_BAD_REQUEST;
+
+    const char *sec_websocket_key =
+        lwan_request_get_header(request, "Sec-WebSocket-Key");
+    if (UNLIKELY(!sec_websocket_key))
+        return HTTP_BAD_REQUEST;
+    const size_t sec_websocket_key_len = strlen(sec_websocket_key);
+    if (UNLIKELY(!base64_validate((void *)sec_websocket_key, sec_websocket_key_len)))
+        return HTTP_BAD_REQUEST;
+
+    sha1_init(&ctx);
+    sha1_update(&ctx, (void *)sec_websocket_key, sec_websocket_key_len);
+    sha1_update(&ctx, websocket_uuid, sizeof(websocket_uuid) - 1);
+    sha1_finalize(&ctx, digest);
+
+    encoded = (char *)base64_encode(digest, sizeof(digest), NULL);
+    if (UNLIKELY(!encoded))
+        return HTTP_INTERNAL_ERROR;
+    coro_defer(request->conn->coro, CORO_DEFER(free), encoded);
+
+    request->flags |= RESPONSE_NO_CONTENT_LENGTH;
+    header_buf_len = lwan_prepare_response_header_full(
+        request, HTTP_SWITCHING_PROTOCOLS, header_buf, sizeof(header_buf),
+        (struct lwan_key_value[]){
+            /* Connection: Upgrade is implicit if conn->flags & CONN_IS_UPGRADE */
+            {.key = "Sec-WebSocket-Accept", .value = encoded},
+            {.key = "Upgrade", .value = "websocket"},
+            {},
+        });
+    if (LIKELY(header_buf_len)) {
+        request->conn->flags |= (CONN_FLIP_FLAGS | CONN_IS_WEBSOCKET);
+
+        lwan_send(request, header_buf, header_buf_len, 0);
+
+        coro_yield(request->conn->coro, CONN_CORO_MAY_RESUME);
+
+        return HTTP_SWITCHING_PROTOCOLS;
+    }
+
+    return HTTP_INTERNAL_ERROR;
 }
 
 static enum lwan_http_status prepare_for_response(struct lwan_url_map *url_map,
@@ -1159,10 +1248,12 @@ char *lwan_process_request(struct lwan *l,
                            struct lwan_value *buffer,
                            char *next_request)
 {
+    char *header_start[N_HEADER_START];
     struct lwan_request_parser_helper helper = {
         .buffer = buffer,
         .next_request = next_request,
         .error_when_n_packets = calculate_n_packets(DEFAULT_BUFFER_SIZE),
+        .header_start = header_start,
     };
     enum lwan_http_status status;
     struct lwan_url_map *url_map;
@@ -1235,8 +1326,8 @@ value_lookup(const struct lwan_key_value_array *array, const char *key)
     return NULL;
 }
 
-const char *
-lwan_request_get_query_param(struct lwan_request *request, const char *key)
+const char *lwan_request_get_query_param(struct lwan_request *request,
+                                         const char *key)
 {
     if (!(request->flags & REQUEST_PARSED_QUERY_STRING)) {
         parse_query_string(request);
@@ -1246,8 +1337,8 @@ lwan_request_get_query_param(struct lwan_request *request, const char *key)
     return value_lookup(&request->query_params, key);
 }
 
-const char *
-lwan_request_get_post_param(struct lwan_request *request, const char *key)
+const char *lwan_request_get_post_param(struct lwan_request *request,
+                                        const char *key)
 {
     if (!(request->flags & REQUEST_PARSED_POST_DATA)) {
         parse_post_data(request);
@@ -1257,8 +1348,8 @@ lwan_request_get_post_param(struct lwan_request *request, const char *key)
     return value_lookup(&request->post_params, key);
 }
 
-const char *
-lwan_request_get_cookie(struct lwan_request *request, const char *key)
+const char *lwan_request_get_cookie(struct lwan_request *request,
+                                    const char *key)
 {
     if (!(request->flags & REQUEST_PARSED_COOKIES)) {
         parse_cookies(request);
@@ -1268,7 +1359,7 @@ lwan_request_get_cookie(struct lwan_request *request, const char *key)
     return value_lookup(&request->cookies, key);
 }
 
-const char *lwan_request_get_header(const struct lwan_request *request,
+const char *lwan_request_get_header(struct lwan_request *request,
                                     const char *header)
 {
     char name[64];

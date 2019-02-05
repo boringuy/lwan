@@ -115,25 +115,26 @@ static const struct {
     const char *status;
     const char *description;
 } status_table[] = {
-    STATUS(200, "OK", "Success!"),
-    STATUS(206, "Partial content", "Delivering part of requested resource."),
-    STATUS(301, "Moved permanently", "This content has moved to another place."),
-    STATUS(304, "Not modified", "The content has not changed since previous request."),
-    STATUS(307, "Temporary Redirect", "This content can be temporarily found at a different location."),
-    STATUS(400, "Bad request", "The client has issued a bad request."),
-    STATUS(401, "Not authorized", "Client has no authorization to access this resource."),
-    STATUS(403, "Forbidden", "Access to this resource has been denied."),
-    STATUS(404, "Not found", "The requested resource could not be found on this server."),
-    STATUS(405, "Not allowed", "The requested method is not allowed by this server."),
-    STATUS(408, "Request timeout", "Client did not produce a request within expected timeframe."),
-    STATUS(413, "Request too large", "The request entity is too large."),
-    STATUS(416, "Requested range unsatisfiable", "The server can't supply the requested portion of the requested resource."),
-    STATUS(418, "I'm a teapot", "Client requested to brew coffee but device is a teapot."),
-    STATUS(420, "Client too high", "Client is too high to make a request."),
-    STATUS(500, "Internal server error", "The server encountered an internal error that couldn't be recovered from."),
-    STATUS(501, "Not implemented", "Server lacks the ability to fulfil the request."),
-    STATUS(503, "Service unavailable", "The server is either overloaded or down for maintenance."),
-    STATUS(520, "Server too high", "The server is too high to answer the request."),
+    STATUS(101, "Switching protocols", "Protocol is switching over from HTTP"),
+    STATUS(200, "OK", "Success"),
+    STATUS(206, "Partial content", "Delivering part of requested resource"),
+    STATUS(301, "Moved permanently", "This content has moved to another place"),
+    STATUS(304, "Not modified", "The content has not changed since previous request"),
+    STATUS(307, "Temporary Redirect", "This content can be temporarily found at a different location"),
+    STATUS(400, "Bad request", "The client has issued a bad request"),
+    STATUS(401, "Not authorized", "Client has no authorization to access this resource"),
+    STATUS(403, "Forbidden", "Access to this resource has been denied"),
+    STATUS(404, "Not found", "The requested resource could not be found on this server"),
+    STATUS(405, "Not allowed", "The requested method is not allowed by this server"),
+    STATUS(408, "Request timeout", "Client did not produce a request within expected timeframe"),
+    STATUS(413, "Request too large", "The request entity is too large"),
+    STATUS(416, "Requested range unsatisfiable", "The server can't supply the requested portion of the requested resource"),
+    STATUS(418, "I'm a teapot", "Client requested to brew coffee but device is a teapot"),
+    STATUS(420, "Client too high", "Client is too high to make a request"),
+    STATUS(500, "Internal server error", "The server encountered an internal error that couldn't be recovered from"),
+    STATUS(501, "Not implemented", "Server lacks the ability to fulfil the request"),
+    STATUS(503, "Service unavailable", "The server is either overloaded or down for maintenance"),
+    STATUS(520, "Server too high", "The server is too high to answer the request"),
 };
 #undef STATUS
 
@@ -206,15 +207,15 @@ static const uint8_t char_prop_tbl[256] = {
 
 ALWAYS_INLINE uint8_t lwan_char_isspace(char ch)
 {
-    return char_prop_tbl[(int)ch] & CHAR_PROP_SPACE;
+    return char_prop_tbl[(unsigned char)ch] & CHAR_PROP_SPACE;
 }
 
 ALWAYS_INLINE uint8_t lwan_char_isxdigit(char ch)
 {
-    return char_prop_tbl[(int)ch] & CHAR_PROP_HEX;
+    return char_prop_tbl[(unsigned char)ch] & CHAR_PROP_HEX;
 }
 
 ALWAYS_INLINE uint8_t lwan_char_isdigit(char ch)
 {
-    return char_prop_tbl[(int)ch] & CHAR_PROP_DIG;
+    return char_prop_tbl[(unsigned char)ch] & CHAR_PROP_DIG;
 }

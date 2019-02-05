@@ -76,6 +76,51 @@ out:
 }
 
 ssize_t
+lwan_readv(struct lwan_request *request, struct iovec *iov, int iov_count)
+{
+    ssize_t total_bytes_read = 0;
+    int curr_iov = 0;
+
+    for (int tries = MAX_FAILED_TRIES; tries;) {
+        ssize_t bytes_read = readv(request->fd, iov + curr_iov, iov_count - curr_iov);
+        if (UNLIKELY(bytes_read < 0)) {
+            /* FIXME: Consider short writes as another try as well? */
+            tries--;
+
+            switch (errno) {
+            case EAGAIN:
+                request->conn->flags |= CONN_FLIP_FLAGS | CONN_MUST_READ;
+                /* fallthrough */
+            case EINTR:
+                goto try_again;
+            default:
+                goto out;
+            }
+        }
+
+        total_bytes_read += bytes_read;
+
+        while (curr_iov < iov_count && bytes_read >= (ssize_t)iov[curr_iov].iov_len) {
+            bytes_read -= (ssize_t)iov[curr_iov].iov_len;
+            curr_iov++;
+        }
+
+        if (curr_iov == iov_count)
+            return total_bytes_read;
+
+        iov[curr_iov].iov_base = (char *)iov[curr_iov].iov_base + bytes_read;
+        iov[curr_iov].iov_len -= (size_t)bytes_read;
+
+try_again:
+        coro_yield(request->conn->coro, CONN_CORO_MAY_RESUME);
+    }
+
+out:
+    coro_yield(request->conn->coro, CONN_CORO_ABORT);
+    __builtin_unreachable();
+}
+
+ssize_t
 lwan_send(struct lwan_request *request, const void *buf, size_t count, int flags)
 {
     ssize_t total_sent = 0;
@@ -101,6 +146,42 @@ lwan_send(struct lwan_request *request, const void *buf, size_t count, int flags
             return total_sent;
         if ((size_t)total_sent < count)
             buf = (char *)buf + written;
+
+try_again:
+        coro_yield(request->conn->coro, CONN_CORO_MAY_RESUME);
+    }
+
+out:
+    coro_yield(request->conn->coro, CONN_CORO_ABORT);
+    __builtin_unreachable();
+}
+
+ssize_t
+lwan_recv(struct lwan_request *request, void *buf, size_t count, int flags)
+{
+    ssize_t total_recv = 0;
+
+    for (int tries = MAX_FAILED_TRIES; tries;) {
+        ssize_t recvd = recv(request->fd, buf, count, flags);
+        if (UNLIKELY(recvd < 0)) {
+            tries--;
+
+            switch (errno) {
+            case EAGAIN:
+                request->conn->flags |= CONN_FLIP_FLAGS | CONN_MUST_READ;
+                /* fallthrough */
+            case EINTR:
+                goto try_again;
+            default:
+                goto out;
+            }
+        }
+
+        total_recv += recvd;
+        if ((size_t)total_recv == count)
+            return total_recv;
+        if ((size_t)total_recv < count)
+            buf = (char *)buf + recvd;
 
 try_again:
         coro_yield(request->conn->coro, CONN_CORO_MAY_RESUME);
@@ -202,8 +283,11 @@ lwan_sendfile(struct lwan_request *request, int in_fd, off_t offset, size_t coun
 #else
 static inline size_t min_size(size_t a, size_t b) { return (a > b) ? b : a; }
 
-static off_t
-try_pread(struct coro *coro, int fd, void *buffer, size_t len, off_t offset)
+static off_t try_pread(struct lwan_request *request,
+                       int fd,
+                       void *buffer,
+                       size_t len,
+                       off_t offset)
 {
     ssize_t total_read = 0;
 
@@ -229,11 +313,11 @@ try_pread(struct coro *coro, int fd, void *buffer, size_t len, off_t offset)
         if ((size_t)total_read == len)
             return offset;
     try_again:
-        coro_yield(coro, CONN_CORO_MAY_RESUME);
+        coro_yield(request->conn->coro, CONN_CORO_MAY_RESUME);
     }
 
 out:
-    coro_yield(coro, CONN_CORO_ABORT);
+    coro_yield(request->conn->coro, CONN_CORO_ABORT);
     __builtin_unreachable();
 }
 
@@ -251,7 +335,7 @@ void lwan_sendfile(struct lwan_request *request,
     while (count) {
         size_t to_read = min_size(count, sizeof(buffer));
 
-        offset = try_pread(request->conn->coro, in_fd, buffer, to_read, offset);
+        offset = try_pread(request, in_fd, buffer, to_read, offset);
         lwan_send(request, buffer, to_read, 0);
         count -= to_read;
     }
